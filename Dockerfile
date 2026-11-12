@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY proxy ./proxy
 COPY upstream ./upstream
+COPY scripts ./scripts
 
 # 实际启动命令由 docker-compose 的 command 指定（同一镜像，两种角色）
 EXPOSE 8000 8001

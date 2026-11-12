@@ -20,6 +20,14 @@ from proxy.cachestore import (
     CacheWait,
 )
 from proxy.policy import cache_eligibility, parse_cache_control
+from proxy.sessions import (
+    ADMIN_COOKIE_NAME,
+    SessionDisabled,
+    SessionRegistry,
+    SessionState,
+    parse_cookies,
+    strip_admin_cookie,
+)
 
 
 class PolicyParseTests(unittest.TestCase):
@@ -221,6 +229,150 @@ class CacheStoreTests(unittest.TestCase):
             self.assertEqual(snap["inflight"], [])
             with self.assertRaises(RuntimeError):
                 await leader.inflight.future
+
+        self._run(scenario())
+
+
+class CookieHelperTests(unittest.TestCase):
+    def test_parse_cookies(self):
+        self.assertEqual(
+            parse_cookies("SID=a; proxy_admin_sid=secret; role=x"),
+            {"SID": "a", "proxy_admin_sid": "secret", "role": "x"},
+        )
+        self.assertEqual(parse_cookies(None), {})
+        self.assertEqual(parse_cookies(""), {})
+        self.assertEqual(parse_cookies("garbage"), {})
+
+    def test_strip_admin_cookie(self):
+        self.assertEqual(
+            strip_admin_cookie("SID=a; proxy_admin_sid=secret; role=x"),
+            "SID=a; role=x",
+        )
+        # 只剩管理 Cookie 时返回空串（代理将不转发 Cookie 头）
+        self.assertEqual(strip_admin_cookie(f"{ADMIN_COOKIE_NAME}=secret"), "")
+        self.assertEqual(strip_admin_cookie(None), "")
+        # 无管理 Cookie 时原样保留
+        self.assertEqual(strip_admin_cookie("SID=a; role=x"), "SID=a; role=x")
+
+
+class SessionRegistryTests(unittest.TestCase):
+    def _run(self, coro):
+        return asyncio.run(coro)
+
+    def test_create_session_random_tokens_and_restart_invalidation(self):
+        async def scenario():
+            reg = SessionRegistry()
+            s1 = reg.create_session()
+            s2 = reg.create_session()
+            self.assertNotEqual(s1.token, s2.token)
+            self.assertGreaterEqual(len(s1.token), 32)
+            self.assertIs(reg.get(s1.token), s1)
+            self.assertIsNone(reg.get("nope"))
+            # 新 registry 模拟进程重启：旧令牌全部失效
+            reg2 = SessionRegistry()
+            self.assertIsNone(reg2.get(s1.token))
+
+        self._run(scenario())
+
+    def test_logout_waits_for_completed_write_and_disables_session(self):
+        async def scenario():
+            reg = SessionRegistry()
+            s = reg.create_session()
+            op = await reg.begin_op(s, "proxy.purge")
+
+            async def slow_work():
+                await asyncio.sleep(0.15)
+                return type("O", (), {"terminal": "completed", "note": "ok"})()
+
+            reg.spawn(s, op, slow_work)
+            # 写操作在途时发起退出
+            logout = asyncio.create_task(reg.logout(s))
+            await asyncio.sleep(0.02)
+            # 退出已禁用会话：新写操作必须被拒绝
+            with self.assertRaises(SessionDisabled):
+                await reg.begin_op(s, "proxy.purge")
+            result = await logout
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(s.state, SessionState.CLOSED)
+            # 关闭后仍拒绝新操作
+            with self.assertRaises(SessionDisabled):
+                await reg.begin_op(s, "proxy.purge")
+            self.assertEqual(result["waited_operations"][0]["status"], "completed")
+
+        self._run(scenario())
+
+    def test_ambiguous_write_makes_logout_incomplete_and_session_stays_disabled(self):
+        async def scenario():
+            reg = SessionRegistry()
+            s = reg.create_session()
+            op1 = await reg.begin_op(s, "upstream.config")
+            op2 = await reg.begin_op(s, "proxy.reset")
+
+            async def ambiguous_work():
+                await asyncio.sleep(0.05)
+                return type("O", (), {
+                    "terminal": "ambiguous", "note": "timed out"})()
+
+            async def ok_work():
+                return type("O", (), {"terminal": "completed", "note": "ok"})()
+
+            reg.spawn(s, op1, ambiguous_work)
+            reg.spawn(s, op2, ok_work)
+            result = await reg.logout(s)
+            self.assertEqual(result["status"], "incomplete")
+            self.assertTrue(result["incomplete_operations"])
+            self.assertEqual(s.state, SessionState.CLOSED)  # 终态但禁用
+            with self.assertRaises(SessionDisabled):
+                await reg.begin_op(s, "upstream.config")
+
+        self._run(scenario())
+
+    def test_duplicate_logout_shares_single_drain(self):
+        async def scenario():
+            reg = SessionRegistry()
+            s = reg.create_session()
+            op = await reg.begin_op(s, "upstream.config")
+
+            async def slow_work():
+                await asyncio.sleep(0.2)
+                return type("O", (), {"terminal": "completed", "note": "ok"})()
+
+            reg.spawn(s, op, slow_work)
+            r1, r2 = await asyncio.gather(reg.logout(s), reg.logout(s))
+            self.assertIs(r1, r2)  # 共享同一结果对象
+            self.assertEqual(r1["status"], "completed")
+            # 已关闭会话再次退出直接返回同一结果
+            r3 = await reg.logout(s)
+            self.assertIs(r3, r1)
+            self.assertIsNotNone(s.drain_task)
+            self.assertTrue(s.drain_task.done())
+
+        self._run(scenario())
+
+    def test_disconnecting_route_does_not_cancel_tracked_write(self):
+        async def scenario():
+            reg = SessionRegistry()
+            s = reg.create_session()
+            op = await reg.begin_op(s, "upstream.config")
+            started = asyncio.Event()
+
+            async def work():
+                started.set()
+                await asyncio.sleep(0.15)
+                return type("O", (), {"terminal": "completed", "note": "ok"})()
+
+            task = reg.spawn(s, op, work)
+            await started.wait()
+            # 模拟路由处理任务被取消（客户端断连）：写任务不受影响
+            route = asyncio.create_task(asyncio.sleep(1))
+            route.cancel()
+            try:
+                await route
+            except asyncio.CancelledError:
+                pass
+            result = await reg.logout(s)
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(task.done())
 
         self._run(scenario())
 

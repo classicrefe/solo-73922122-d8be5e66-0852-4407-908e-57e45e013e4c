@@ -6,6 +6,8 @@
   * public  -> Cache-Control: public, max-age=N（可缓存）
   * personal -> Set-Cookie + Cache-Control: private, no-store（不可缓存）
 - 可配置人工延迟与失败模式（500 / 超长延迟触发代理超时）；
+- 管理端配置提交支持延迟生效：持久化 config_delay_ms 或单次 delay_ms，
+  供代理侧演示“慢配置期间退出等待”和“写超时/回执不明”；
 - 管理端可查看请求计数与最近请求记录，便于验证缓存与合并行为。
 """
 
@@ -61,6 +63,9 @@ DEFAULT_CONFIG = {
     "failure": "none",          # none | error500
     "max_age": 30,
     "cache_control": None,      # 非空时作为原始 Cache-Control 直接下发
+    # 管理端提交配置（POST /admin/config）时的人工处理延迟，
+    # 用于演示代理侧“慢配置期间退出等待”与“写超时/回执不明”。
+    "config_delay_ms": 0,
 }
 
 # 全局默认 + 按公告覆盖
@@ -213,7 +218,14 @@ async def admin_config(payload: dict[str, Any]) -> dict[str, Any]:
     notice_id = payload.get("notice_id")
     fields = {
         k: payload[k]
-        for k in ("profile", "latency_ms", "failure", "max_age", "cache_control")
+        for k in (
+            "profile",
+            "latency_ms",
+            "failure",
+            "max_age",
+            "cache_control",
+            "config_delay_ms",
+        )
         if k in payload
     }
     if "profile" in fields and fields["profile"] not in ("public", "personal"):
@@ -224,13 +236,50 @@ async def admin_config(payload: dict[str, Any]) -> dict[str, Any]:
         return JSONResponse(
             status_code=400, content={"error": "failure must be none|error500"}
         )
+    for int_field in ("latency_ms", "max_age", "config_delay_ms"):
+        if int_field in fields:
+            try:
+                fields[int_field] = int(fields[int_field])
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"{int_field} must be a non-negative integer"},
+                )
+            if fields[int_field] < 0:
+                return JSONResponse(
+                    status_code=400,
+                    content={"error": f"{int_field} must be a non-negative integer"},
+                )
+
+    # 提交延迟：持久化的 config_delay_ms（默认配置）可被本次请求的
+    # 单次 delay_ms 覆盖；delay_ms 不持久化，只影响这一次提交。
+    base_delay = int(state["defaults"].get("config_delay_ms", 0))
+    try:
+        one_shot_delay = int(payload.get("delay_ms", base_delay))
+    except (TypeError, ValueError):
+        return JSONResponse(
+            status_code=400,
+            content={"error": "delay_ms must be a non-negative integer"},
+        )
+    if one_shot_delay < 0:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "delay_ms must be a non-negative integer"},
+        )
+    if one_shot_delay:
+        await asyncio.sleep(one_shot_delay / 1000.0)
+
     if notice_id:
         target = state["overrides"].setdefault(str(notice_id), {})
         target.update(fields)
     else:
         state["defaults"].update(fields)
     _bump_version()
-    return {"ok": True, "state": await admin_state()}
+    return {
+        "ok": True,
+        "applied_delay_ms": one_shot_delay,
+        "state": await admin_state(),
+    }
 
 
 @app.post("/admin/reset")

@@ -1,27 +1,41 @@
-"""FastAPI 单进程 HTTP 缓存代理。
+"""FastAPI 单进程 HTTP 缓存代理（含管理登录与退出收尾）。
 
 规则摘要：
 - 仅代理 GET /notices/{notice_id}，上游地址固定（环境变量 UPSTREAM_BASE）。
 - 带 Cookie 或 Authorization 的请求直连上游：不读、不写缓存，也不参与
-  匿名请求合并。
+  匿名请求合并。管理会话 Cookie（proxy_admin_sid）在转发前会被剥离，
+  既不会发往上游，也不会触发直连绕过。
 - 匿名响应仅在 200 + Cache-Control 含 public 且含合法非负整数 max-age、
   无 private/no-store、无 Set-Cookie 时缓存；过期不复用。
 - 同键并发未命中只请求上游一次；单个等待者断开不影响其他等待者；
   上游失败不缓存并结束所有等待。
 - 按公告清除会删除该公告全部语言缓存，并使清除前的在途响应无法回填、
   清除后的新请求无法复用旧在途结果。
+
+管理安全：
+- 管理口令来自启动配置 ADMIN_PASSWORD（必填，缺失则拒绝启动）。
+- POST /proxy/login 校验口令后签发随机 HttpOnly 会话 Cookie，Path=/proxy，
+  SameSite=Strict，仅存内存，进程重启即失效。
+- 除登录外，所有 /proxy 接口都要求有效会话；退出中的会话拒绝一切新请求。
+- 所有管理 POST 必须携带与 ADMIN_ALLOWED_ORIGIN 完全一致的 Origin 头，
+  缺失或不符一律 403。
+- 退出（POST /proxy/logout）先禁用会话，再等待该会话先前获准的写操作
+  全部进入终态；重复退出共享同一等待；写操作的客户端断连不影响收尾。
+- 写操作超时 / 回执不明时退出结果为 incomplete，会话保持禁用，绝不报成功。
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, Request, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse
 
 from .cachestore import (
@@ -33,9 +47,26 @@ from .cachestore import (
     InFlight,
 )
 from .policy import cache_eligibility
+from .sessions import (
+    ADMIN_COOKIE_NAME,
+    AdminSession,
+    SessionDisabled,
+    SessionRegistry,
+    SessionState,
+    parse_cookies,
+    strip_admin_cookie,
+)
 
 UPSTREAM_BASE = os.environ.get("UPSTREAM_BASE", "http://upstream:8001").rstrip("/")
 HTTP_TIMEOUT = float(os.environ.get("UPSTREAM_TIMEOUT_SECONDS", "15"))
+# 管理类上游写操作单独的超时配置：超出即判定“回执不明”
+ADMIN_UPSTREAM_TIMEOUT = float(os.environ.get("ADMIN_TIMEOUT_SECONDS", "8"))
+# 启动配置的管理口令；未配置时拒绝启动，避免默认弱口令
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
+# 管理 POST 允许的固定 Origin（浏览器对 fetch POST 总会带 Origin）
+ADMIN_ALLOWED_ORIGIN = os.environ.get(
+    "ADMIN_ALLOWED_ORIGIN", "http://localhost:8000"
+).rstrip("/")
 
 # 转发给上游的请求头白名单（逐跳头、Host 等不带）
 FORWARD_REQUEST_HEADERS = {
@@ -78,9 +109,38 @@ HOP_BY_HOP = {
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="Notice Cache Proxy", version="1.0.0")
+app = FastAPI(title="Notice Cache Proxy", version="2.0.0")
 store = CacheStore()
+sessions = SessionRegistry()
 _client: httpx.AsyncClient | None = None
+_admin_client: httpx.AsyncClient | None = None
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _client, _admin_client
+    if not ADMIN_PASSWORD:
+        raise RuntimeError(
+            "ADMIN_PASSWORD is required but not set; refusing to start without "
+            "an admin password"
+        )
+    _client = httpx.AsyncClient(
+        base_url=UPSTREAM_BASE,
+        timeout=httpx.Timeout(HTTP_TIMEOUT),
+        follow_redirects=False,
+    )
+    _admin_client = httpx.AsyncClient(
+        base_url=UPSTREAM_BASE,
+        timeout=httpx.Timeout(ADMIN_UPSTREAM_TIMEOUT),
+        follow_redirects=False,
+    )
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    for client in (_client, _admin_client):
+        if client is not None:
+            await client.aclose()
 
 
 @dataclass
@@ -91,26 +151,97 @@ class FetchResult:
     request_id: str | None
 
 
-@app.on_event("startup")
-async def _startup() -> None:
-    global _client
-    _client = httpx.AsyncClient(
-        base_url=UPSTREAM_BASE,
-        timeout=httpx.Timeout(HTTP_TIMEOUT),
-        follow_redirects=False,
+@dataclass
+class WriteOutcome:
+    """管理写操作的可序列化结果与终态标记。"""
+
+    terminal: str  # completed | ambiguous
+    status_code: int
+    payload: object
+    note: str = ""
+
+
+# ---------------- 认证 / CSRF 防护 ----------------
+
+
+async def require_origin(request: Request) -> None:
+    """管理 POST 固定 Origin 校验：缺失或不符即拒绝。"""
+    origin = request.headers.get("origin")
+    if not origin or origin.rstrip("/") != ADMIN_ALLOWED_ORIGIN:
+        raise _http_403(
+            "origin check failed: missing or non-matching Origin header",
+            error_code="bad_origin",
+        )
+
+
+def _http_401(message: str, *, error_code: str = "unauthorized") -> HTTPException:
+    return HTTPException(
+        status_code=401,
+        detail=message,
+        headers={"Cache-Control": "no-store", "X-Admin-Error": error_code},
     )
 
 
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    if _client is not None:
-        await _client.aclose()
+def _http_403(message: str, *, error_code: str = "forbidden") -> HTTPException:
+    return HTTPException(
+        status_code=403,
+        detail=message,
+        headers={"Cache-Control": "no-store", "X-Admin-Error": error_code},
+    )
+
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(
+    request: Request, exc: HTTPException
+) -> JSONResponse:
+    error_code = "error"
+    headers = getattr(exc, "headers", None) or {}
+    if "X-Admin-Error" in headers:
+        error_code = headers["X-Admin-Error"]
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail, "error": error_code},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def require_session(request: Request) -> AdminSession:
+    """除登录外全部 /proxy 接口的会话认证依赖。"""
+    token = parse_cookies(request.headers.get("cookie")).get(ADMIN_COOKIE_NAME)
+    session = sessions.get(token)
+    if session is None:
+        raise _http_401("admin session missing or invalid")
+    if session.state != SessionState.ACTIVE:
+        # draining / closed：退出已生效，拒绝该会话的一切新管理请求
+        raise _http_401(
+            f"session is {session.state.value}; admin requests are disabled",
+            error_code="session_disabled",
+        )
+    return session
+
+
+def _set_session_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=ADMIN_COOKIE_NAME,
+        value=token,
+        path="/proxy",
+        httponly=True,
+        samesite="strict",
+        secure=False,  # 本地 http 演示；生产置于 https 反代后应开启
+        max_age=None,  # 会话 Cookie：浏览器关闭即失效；进程重启同样失效
+    )
+
+
+# ---------------- 上游请求与缓存 ----------------
 
 
 def _is_personal(request: Request) -> bool:
-    cookie = request.headers.get("cookie", "").strip()
+    cookies = parse_cookies(request.headers.get("cookie"))
+    # 管理 Cookie 不属于业务身份，既不触发绕过也不会转发上游
+    cookies.pop(ADMIN_COOKIE_NAME, None)
+    has_cookie = bool("; ".join(f"{k}={v}" for k, v in cookies.items()).strip())
     auth = request.headers.get("authorization", "").strip()
-    return bool(cookie) or bool(auth)
+    return has_cookie or bool(auth)
 
 
 def _forward_headers(request: Request) -> dict[str, str]:
@@ -118,6 +249,10 @@ def _forward_headers(request: Request) -> dict[str, str]:
     for k, v in request.headers.items():
         lk = k.lower()
         if lk in FORWARD_REQUEST_HEADERS and lk not in HOP_BY_HOP:
+            if lk == "cookie":
+                v = strip_admin_cookie(v)  # 管理 Cookie 绝不发往上游
+                if not v:
+                    continue
             out[k] = v
     return out
 
@@ -317,7 +452,160 @@ async def proxy_notice(notice_id: str, request: Request) -> Response:
     )
 
 
-# ---------------- 管理 / 演示接口 ----------------
+# ---------------- 管理：登录 / 退出 / 会话 ----------------
+
+
+@app.post("/proxy/login", dependencies=[Depends(require_origin)])
+async def admin_login(request: Request) -> Response:
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse(
+            status_code=400, content={"detail": "invalid JSON body"}
+        )
+    password = str(payload.get("password", "")) if isinstance(payload, dict) else ""
+    if not hmac.compare_digest(password, ADMIN_PASSWORD):
+        # 固定延时，降低口令时序侧信道（对比本身也用了恒定时间函数）
+        await asyncio.sleep(0.2)
+        raise _http_401("invalid admin password", error_code="bad_password")
+    session = sessions.create_session()
+    response = JSONResponse(
+        status_code=200,
+        content={
+            "ok": True,
+            "session": session.public_view(),
+            "allowed_origin": ADMIN_ALLOWED_ORIGIN,
+        },
+    )
+    _set_session_cookie(response, session.token)
+    return response
+
+
+@app.post(
+    "/proxy/logout",
+    dependencies=[Depends(require_origin)],
+)
+async def admin_logout(request: Request) -> Response:
+    token = parse_cookies(request.headers.get("cookie")).get(ADMIN_COOKIE_NAME)
+    session = sessions.get(token)
+    if session is None:
+        # 无有效会话：幂等拒绝，但不泄露令牌是否存在过
+        raise _http_401("no active admin session")
+    # 立即禁用会话（drain 内部先置 draining），随后等待在途写操作收尾。
+    # 重复退出共享同一个 drain future；客户端断连后 drain 仍在后台继续。
+    result = await sessions.logout(session)
+    response = JSONResponse(status_code=200, content=result)
+    response.delete_cookie(
+        key=ADMIN_COOKIE_NAME,
+        path="/proxy",
+        httponly=True,
+        samesite="strict",
+    )
+    return response
+
+
+@app.get("/proxy/session")
+async def admin_session(
+    session: AdminSession = Depends(require_session),
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "ok": True,
+            "session": session.public_view(),
+            "allowed_origin": ADMIN_ALLOWED_ORIGIN,
+        }
+    )
+
+
+# ---------------- 管理写操作（受会话 + Origin 保护，可被退出等待） ----------------
+
+
+def _outcome_response(outcome: WriteOutcome) -> Response:
+    if outcome.terminal == "ambiguous":
+        # 回执不明：客户端看到 504，但操作仍在后台跑/可能已生效
+        return JSONResponse(
+            status_code=504,
+            content={
+                "detail": outcome.note,
+                "upstream": UPSTREAM_BASE,
+                "receipt": "ambiguous",
+                "upstream_response": outcome.payload,
+            },
+            headers={"X-Admin-Write": "ambiguous", "Cache-Control": "no-store"},
+        )
+    return JSONResponse(
+        status_code=outcome.status_code,
+        content=outcome.payload,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def _run_tracked(
+    session: AdminSession,
+    kind: str,
+    work: Callable[[], Awaitable[WriteOutcome]],
+) -> Response:
+    """登记并在独立任务中执行写操作。
+
+    - 会话已退出：拒绝（401），不登记新操作；
+    - 客户端断连只取消路由处理，后台写任务继续直到终态；
+    - 超时/传输异常标记 ambiguous，退出时因此不能报成功。
+    """
+    try:
+        op = await sessions.begin_op(session, kind)
+    except SessionDisabled as exc:
+        raise _http_401(
+            f"session disabled ({exc}); write rejected",
+            error_code="session_disabled",
+        ) from exc
+    sessions.spawn(session, op, work)
+    assert op.task is not None
+    try:
+        outcome: WriteOutcome = await op.task
+    except asyncio.CancelledError:
+        # 路由任务被取消（客户端断连）：写任务不受影响，仍可由退出等待。
+        # 重新等待以拿到终态，仅用于兜底返回。
+        outcome = await op.task
+    return _outcome_response(outcome)
+
+
+@app.post("/proxy/purge/{notice_id}")
+async def purge_notice(
+    notice_id: str,
+    request: Request,
+    session: AdminSession = Depends(require_session),
+    _origin: None = Depends(require_origin),
+) -> Response:
+    async def work() -> WriteOutcome:
+        info = await store.purge_notice(notice_id)
+        return WriteOutcome(
+            terminal="completed",
+            status_code=200,
+            payload={"purged": notice_id, **info},
+            note="local cache purge completed",
+        )
+
+    return await _run_tracked(session, "proxy.purge", work)
+
+
+@app.post("/proxy/reset")
+async def proxy_reset(
+    request: Request,
+    session: AdminSession = Depends(require_session),
+    _origin: None = Depends(require_origin),
+) -> Response:
+    async def work() -> WriteOutcome:
+        return WriteOutcome(
+            terminal="completed",
+            status_code=200,
+            payload=await store.reset(),
+            note="local cache reset completed",
+        )
+
+    return await _run_tracked(session, "proxy.reset", work)
+
+
+# ---------------- 管理只读接口 ----------------
 
 
 def _passthrough(r: httpx.Response) -> Response:
@@ -325,69 +613,107 @@ def _passthrough(r: httpx.Response) -> Response:
         content=r.content,
         status_code=r.status_code,
         media_type=r.headers.get("content-type"),
+        headers={"Cache-Control": "no-store"},
     )
 
 
 @app.get("/proxy/state")
-async def proxy_state() -> JSONResponse:
+async def proxy_state(
+    session: AdminSession = Depends(require_session),
+) -> JSONResponse:
     return JSONResponse(await store.snapshot())
 
 
-@app.post("/proxy/purge/{notice_id}")
-async def purge_notice(notice_id: str) -> JSONResponse:
-    info = await store.purge_notice(notice_id)
-    return JSONResponse({"purged": notice_id, **info})
-
-
-@app.post("/proxy/reset")
-async def proxy_reset() -> JSONResponse:
-    return JSONResponse(await store.reset())
-
-
 @app.get("/proxy/upstream/state")
-async def upstream_state() -> Response:
-    assert _client is not None
+async def upstream_state(
+    session: AdminSession = Depends(require_session),
+) -> Response:
+    assert _admin_client is not None
     try:
-        return _passthrough(await _client.get("/admin/state"))
+        return _passthrough(await _admin_client.get("/admin/state"))
     except httpx.HTTPError as exc:
         return _error_response(f"upstream admin unreachable: {exc}")
 
 
 @app.get("/proxy/upstream/requests")
-async def upstream_requests() -> Response:
-    assert _client is not None
+async def upstream_requests(
+    session: AdminSession = Depends(require_session),
+) -> Response:
+    assert _admin_client is not None
     try:
-        return _passthrough(await _client.get("/admin/requests"))
+        return _passthrough(await _admin_client.get("/admin/requests"))
     except httpx.HTTPError as exc:
         return _error_response(f"upstream admin unreachable: {exc}")
+
+
+# ---------------- 管理写：上游配置（慢操作 / 回执不明的来源） ----------------
+
+
+async def _upstream_admin_post(path: str, payload: bytes, kind: str):
+    """执行一次上游管理写，返回带终态的 WriteOutcome。"""
+    assert _admin_client is not None
+    try:
+        r = await _admin_client.post(
+            path,
+            content=payload,
+            headers={"content-type": "application/json"},
+        )
+    except httpx.TimeoutException as exc:
+        # 超时：上游可能已收到且稍后生效 —— 回执不明
+        return WriteOutcome(
+            terminal="ambiguous",
+            status_code=504,
+            payload=None,
+            note=f"upstream admin write timed out after {ADMIN_UPSTREAM_TIMEOUT}s: {exc}",
+        )
+    except httpx.HTTPError as exc:
+        # 连接失败/响应未读完等：同样回执不明
+        return WriteOutcome(
+            terminal="ambiguous",
+            status_code=504,
+            payload=None,
+            note=f"upstream admin write transport error: {exc}",
+        )
+    body = r.content
+    try:
+        parsed = r.json()
+    except Exception:  # noqa: BLE001
+        parsed = body.decode("utf-8", "replace")
+    # 拿到明确 HTTP 回执（含 4xx/5xx）即视为已知终态；不成功但不“不明”
+    return WriteOutcome(
+        terminal="completed",
+        status_code=r.status_code,
+        payload=parsed,
+        note=f"upstream acknowledged with HTTP {r.status_code}",
+    )
 
 
 @app.post("/proxy/upstream/config")
-async def upstream_config(request: Request) -> Response:
-    assert _client is not None
+async def upstream_config(
+    request: Request,
+    session: AdminSession = Depends(require_session),
+    _origin: None = Depends(require_origin),
+) -> Response:
     payload = await request.body()
-    try:
-        r = await _client.post(
-            "/admin/config",
-            content=payload,
-            headers={
-                "content-type": request.headers.get(
-                    "content-type", "application/json"
-                )
-            },
-        )
-    except httpx.HTTPError as exc:
-        return _error_response(f"upstream admin unreachable: {exc}")
-    return _passthrough(r)
+
+    async def work() -> WriteOutcome:
+        return await _upstream_admin_post("/admin/config", payload, "upstream.config")
+
+    return await _run_tracked(session, "upstream.config", work)
 
 
 @app.post("/proxy/upstream/reset")
-async def upstream_reset() -> Response:
-    assert _client is not None
-    try:
-        return _passthrough(await _client.post("/admin/reset"))
-    except httpx.HTTPError as exc:
-        return _error_response(f"upstream admin unreachable: {exc}")
+async def upstream_reset(
+    request: Request,
+    session: AdminSession = Depends(require_session),
+    _origin: None = Depends(require_origin),
+) -> Response:
+    async def work() -> WriteOutcome:
+        return await _upstream_admin_post(
+            "/admin/reset", b"{}", "upstream.reset"
+        )
+
+    return await _run_tracked(session, "upstream.reset", work)
 
 
 @app.get("/")

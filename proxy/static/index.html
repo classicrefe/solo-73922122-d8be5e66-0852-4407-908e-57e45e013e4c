@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>内网门户 · 缓存代理演示</title>
+<title>内网门户 · 缓存代理与管理会话演示</title>
 <style>
   :root {
     --bg: #0f1420; --panel: #182033; --panel2: #1f2a42;
@@ -43,6 +43,7 @@
   .pill.miss { background: rgba(91,141,239,.2); color: var(--accent); }
   .pill.bypass { background: rgba(224,168,61,.2); color: var(--amber); }
   .pill.err { background: rgba(229,96,96,.2); color: var(--red); }
+  .pill.ok { background: rgba(63,191,127,.18); color: var(--green); }
   pre { background: #0b1020; border: 1px solid var(--line); border-radius: 8px;
     padding: 12px; overflow: auto; max-height: 340px; font: 12px/1.55 var(--mono); }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -55,24 +56,68 @@
   .note { font-size: 12px; color: var(--muted); background: var(--panel2);
     border-left: 3px solid var(--accent); padding: 8px 10px; border-radius: 0 6px 6px 0;
     margin-top: 10px; }
+  .note.warn { border-left-color: var(--amber); }
+  .note.danger { border-left-color: var(--red); }
   .tag-true { color: var(--red); font-weight: 700; }
   .tag-false { color: var(--muted); }
   .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .statusline { font-size: 12px; color: var(--muted); margin-top: 8px; }
   .flow { font: 12px var(--mono); color: var(--muted); white-space: pre-wrap; }
+  .locked { opacity: .55; pointer-events: none; }
+  #authStatus { margin-top: 10px; padding: 8px 10px; border-radius: 7px;
+    background: var(--panel2); font-size: 12px; font-family: var(--mono); }
+  #authStatus.on { border-left: 3px solid var(--green); }
+  #authStatus.off { border-left: 3px solid var(--red); }
+  .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--muted);
+    border-top-color: transparent; border-radius: 50%; animation: spin .8s linear infinite;
+    vertical-align: -2px; margin-right: 6px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
 <header>
-  <h1>内网门户公告 · 单进程缓存代理</h1>
-  <span class="sub">FastAPI + httpx · 仅代理 <span class="mono">GET /notices/{id}</span> · 缓存键 = 公告 ID + Accept-Language</span>
+  <h1>内网门户公告 · 单进程缓存代理 + 管理会话</h1>
+  <span class="sub">FastAPI + httpx · 业务接口 <span class="mono">GET /notices/{id}</span> 无需登录 ·
+    管理接口 <span class="mono">/proxy/*</span> 须登录 · 会话 Cookie HttpOnly Path=/proxy</span>
 </header>
 
 <main>
-  <!-- ============ 左列：请求与上游控制 ============ -->
+  <!-- ============ 左列 ============ -->
   <div>
+    <!-- 登录 / 退出 -->
     <section class="panel">
-      <h2>① 发起请求</h2>
+      <h2>⓪ 管理登录与退出（drain）</h2>
+      <div id="loginBox">
+        <label>管理口令（启动配置 ADMIN_PASSWORD，本地默认 admin123）</label>
+        <input id="adminPassword" type="password" placeholder="输入管理口令" autocomplete="current-password" />
+        <div class="btns">
+          <button id="loginBtn">登录管理页</button>
+        </div>
+      </div>
+      <div id="logoutBox" class="locked">
+        <div class="btns">
+          <button class="danger" id="logoutBtn">退出登录（等待在途写操作收尾）</button>
+        </div>
+        <div class="grid2" style="margin-top:6px">
+          <button class="warn" id="demoSlowBtn">演示：慢配置期间退出</button>
+          <button class="danger" id="demoTimeoutBtn">演示：上游写超时后退出（未完成）</button>
+        </div>
+        <div class="note warn">
+          “慢配置期间退出”：先提交一次 6 秒延迟的上游配置，立即发起退出；
+          退出会先禁用本会话（新管理请求被拒），并等待该写操作结束后才返回成功。
+          同时演示两个退出请求共享同一次等待。
+        </div>
+        <div class="note danger">
+          “写超时后退出”：提交超过管理超时（默认 8s）的配置，代理回执不明（504）；
+          退出结果为 <b>incomplete</b>，会话保持禁用；稍后上游实际生效，可重新登录核对。
+        </div>
+      </div>
+      <div id="authStatus" class="off">未登录：管理接口不可用，公告访问不受影响。</div>
+    </section>
+
+    <!-- 公告请求：无需登录 -->
+    <section class="panel">
+      <h2>① 发起公告请求（公开，无需登录）</h2>
       <label>公告 ID</label>
       <select id="noticeId">
         <option>1</option><option>2</option><option>3</option>
@@ -89,7 +134,7 @@
       <label>演示身份</label>
       <select id="identity">
         <option value="anon">匿名（无 Cookie / Authorization，走缓存）</option>
-        <option value="cookie">携带 Cookie（直连，绕过缓存）</option>
+        <option value="cookie">携带业务 Cookie（直连，绕过缓存）</option>
         <option value="auth">携带 Authorization: Bearer（直连，绕过缓存）</option>
         <option value="both">同时携带 Cookie + Authorization</option>
       </select>
@@ -98,16 +143,17 @@
       <div class="btns">
         <button id="sendBtn">发送请求</button>
         <button class="secondary" id="burstBtn">并发 6 个同键请求</button>
-        <button class="secondary" id="clearCookieBtn">清除本地 Cookie</button>
+        <button class="secondary" id="clearCookieBtn">清除本地非 HttpOnly Cookie</button>
       </div>
       <div class="note">
-        响应头 <b>X-Cache</b>：HIT 命中 / MISS 首次未命中且已缓存 /
-        MISS-NO-CACHE 未命中但不可缓存 / MISS-WAIT 合并等待 / BYPASS 带身份直连 / ERROR 上游失败。
+        管理会话 Cookie 为 HttpOnly 且 Path=/proxy：脚本无法读取，也不会随
+        /notices 请求发送；代理转发上游前还会再次剥离它。
       </div>
     </section>
 
-    <section class="panel">
-      <h2>② 按公告清除缓存（全部语言）</h2>
+    <!-- 管理操作：登录后可用 -->
+    <section class="panel adminOnly locked" id="purgePanel">
+      <h2>② 按公告清除缓存（全部语言）· 管理写操作</h2>
       <div class="row">
         <div>
           <label>要清除的公告 ID</label>
@@ -125,8 +171,8 @@
       </div>
     </section>
 
-    <section class="panel">
-      <h2>③ 本地上游控制</h2>
+    <section class="panel adminOnly locked" id="upstreamPanel">
+      <h2>③ 本地上游控制 · 管理写操作</h2>
       <div class="row">
         <div>
           <label>响应类型</label>
@@ -145,7 +191,7 @@
       </div>
       <div class="row">
         <div>
-          <label>人工延迟（毫秒）</label>
+          <label>公告人工延迟（毫秒）</label>
           <input id="upLatency" type="number" value="200" min="0" step="50" />
         </div>
         <div>
@@ -153,8 +199,16 @@
           <input id="upMaxAge" type="number" value="30" min="0" />
         </div>
       </div>
-      <label>仅对此公告生效（留空 = 全局默认）</label>
-      <input id="upScopeNotice" placeholder="例如 1；留空应用到所有公告" />
+      <div class="row">
+        <div>
+          <label>配置提交延迟 config_delay_ms（毫秒，持久）</label>
+          <input id="upConfigDelay" type="number" value="0" min="0" step="100" />
+        </div>
+        <div>
+          <label>仅对此公告生效（留空 = 全局默认）</label>
+          <input id="upScopeNotice" placeholder="例如 1；留空应用到所有公告" />
+        </div>
+      </div>
       <div class="btns">
         <button id="applyUpstream">应用上游配置</button>
         <button class="secondary" id="resetUpstream">重置上游与统计</button>
@@ -163,12 +217,12 @@
         <button class="secondary" id="presetPublic">预设：公开可缓存</button>
         <button class="secondary" id="presetPersonal">预设：个人页面</button>
         <button class="secondary" id="presetFail">预设：失败 500</button>
-        <button class="secondary" id="presetSlow">预设：高延迟 3s</button>
+        <button class="secondary" id="presetSlow">预设：公告高延迟 3s</button>
       </div>
     </section>
   </div>
 
-  <!-- ============ 右列：结果与状态 ============ -->
+  <!-- ============ 右列 ============ -->
   <div>
     <section class="panel">
       <h2>④ 最近一次响应</h2>
@@ -177,7 +231,7 @@
       <div style="margin-top:10px"><pre id="respHeaders">（空）</pre></div>
     </section>
 
-    <section class="panel">
+    <section class="panel adminOnly locked" id="statePanel">
       <h2>⑤ 代理内部状态（缓存 / 在途 / 代际）
         <button class="secondary" style="float:right;margin-top:-4px" id="refreshState">刷新</button>
       </h2>
@@ -200,8 +254,8 @@
       <pre id="rawState" style="margin-top:10px;max-height:200px"></pre>
     </section>
 
-    <section class="panel">
-      <h2>⑥ 上游实际收到的请求（验证缓存 / 合并 / 绕过）
+    <section class="panel adminOnly locked" id="upstreamLogPanel">
+      <h2>⑥ 上游实际收到的请求（验证缓存 / 合并 / 绕过 / 管理 Cookie 不外泄）
         <button class="secondary" style="float:right;margin-top:-4px" id="refreshUpstream">刷新</button>
       </h2>
       <div id="upCounters" class="statusline"></div>
@@ -218,10 +272,34 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
+let loggedIn = false;
+
+function setLoggedIn(on, info) {
+  loggedIn = on;
+  $("loginBox").classList.toggle("locked", on);
+  $("logoutBox").classList.toggle("locked", !on);
+  document.querySelectorAll(".adminOnly").forEach(el => el.classList.toggle("locked", !on));
+  const st = $("authStatus");
+  st.className = on ? "on" : "off";
+  if (on && info) {
+    st.textContent = `已登录：会话 ${info.session.id}… 状态=${info.session.state} ` +
+      `累计写操作=${info.session.total_operations} · 固定 Origin=${info.allowed_origin}`;
+  } else {
+    st.textContent = "未登录：管理接口不可用，公告访问不受影响。";
+  }
+}
+
+async function checkSession() {
+  try {
+    const r = await fetch("/proxy/session");
+    if (r.ok) { setLoggedIn(true, await r.json()); return true; }
+    setLoggedIn(false); return false;
+  } catch (_) { setLoggedIn(false); return false; }
+}
 
 function refreshCookieStatus() {
   $("cookieStatus").textContent =
-    "当前浏览器 document.cookie：" + (document.cookie || "（无）");
+    "当前浏览器 document.cookie（HttpOnly 管理 Cookie 不可见）：" + (document.cookie || "（无）");
 }
 
 function identityHeaders() {
@@ -275,8 +353,22 @@ async function doFetch(label) {
   return resp;
 }
 
+// 管理请求统一封装：同源 fetch 浏览器自动带 Origin；401 时自动回到未登录态
+async function adminFetch(url, options = {}) {
+  if (!loggedIn) throw new Error("未登录，管理接口不可用");
+  const r = await fetch(url, options);
+  if (r.status === 401) {
+    const detail = (await r.json().catch(() => ({}))).detail || "session disabled";
+    setLoggedIn(false);
+    $("respMeta").innerHTML = `<span class="pill err">401</span> 管理请求被拒绝：${detail}`;
+    throw new Error(detail);
+  }
+  return r;
+}
+
 async function refreshState() {
-  const s = await (await fetch("/proxy/state")).json();
+  if (!loggedIn) return;
+  const s = await (await adminFetch("/proxy/state")).json();
   const ct = $("cacheTable").querySelector("tbody");
   ct.innerHTML = s.cache.length ? s.cache.map(c =>
     `<tr><td class="mono">${c.notice_id}</td>
@@ -296,15 +388,16 @@ async function refreshState() {
 }
 
 async function refreshUpstream() {
+  if (!loggedIn) return;
   const [st, reqs] = await Promise.all([
-    (await fetch("/proxy/upstream/state")).json(),
-    (await fetch("/proxy/upstream/requests")).json(),
+    (await adminFetch("/proxy/upstream/state")).json(),
+    (await adminFetch("/proxy/upstream/requests")).json(),
   ]);
   $("upCounters").textContent =
     `上游总请求数：${st.counters.total_requests} · 按公告：` +
     JSON.stringify(st.counters.by_notice) +
     ` · 按类型：` + JSON.stringify(st.counters.by_profile) +
-    ` · content_version=${st.content_version}`;
+    ` · content_version=${st.content_version} · 配置提交延迟=${st.defaults.config_delay_ms}ms`;
   const tb = $("upstreamTable").querySelector("tbody");
   tb.innerHTML = reqs.requests.length ? reqs.requests.map(r =>
     `<tr><td class="mono">${r.ts}</td><td class="mono">${r.request_id}</td>
@@ -321,21 +414,141 @@ async function applyUpstreamConfig(extra) {
     failure: $("upFailure").value,
     latency_ms: Number($("upLatency").value),
     max_age: Number($("upMaxAge").value),
+    config_delay_ms: Number($("upConfigDelay").value || 0),
   }, extra || {});
   const scope = $("upScopeNotice").value.trim();
   if (scope) body.notice_id = scope;
-  const r = await fetch("/proxy/upstream/config", {
+  const r = await adminFetch("/proxy/upstream/config", {
     method: "POST", headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
   });
   const data = await r.json();
   await Promise.all([refreshUpstream(), refreshState()]);
+  return { httpStatus: r.status, data };
+}
+
+// ---------- 登录 / 退出 ----------
+
+$("loginBtn").onclick = async () => {
+  const password = $("adminPassword").value;
+  const r = await fetch("/proxy/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ password }),
+  });
+  const data = await r.json();
+  if (!r.ok) {
+    $("authStatus").className = "off";
+    $("authStatus").textContent = "登录失败：" + (data.detail || r.status);
+    return;
+  }
+  setLoggedIn(true, data);
+  $("respMeta").innerHTML = `<span class="pill ok">LOGIN OK</span> 已签发 HttpOnly 会话 Cookie（Path=/proxy）`;
+  await Promise.all([refreshState(), refreshUpstream()]);
+};
+
+async function doLogout(label) {
+  const t0 = performance.now();
+  $("respMeta").innerHTML = `<span class="spinner"></span>${label}：退出等待中（会话已禁用，新管理请求会被拒绝）…`;
+  let r;
+  try {
+    r = await fetch("/proxy/logout", { method: "POST" });
+  } catch (e) {
+    $("respMeta").innerHTML = `<span class="pill err">NETWORK</span> 退出请求断连：${e}（后台仍在收尾，可重新登录后核对）`;
+    await checkSession();
+    return null;
+  }
+  const ms = Math.round(performance.now() - t0);
+  const data = await r.json();
+  setLoggedIn(false);
+  const pill = data.status === "completed"
+    ? `<span class="pill ok">COMPLETED</span>`
+    : `<span class="pill err">INCOMPLETE</span>`;
+  $("respMeta").innerHTML =
+    `${label} · 耗时 ${ms} ms · ${pill} status=<b>${data.status}</b><br>` +
+    `<span class="muted">${data.detail || ""}</span>`;
+  $("respBody").textContent = JSON.stringify(data, null, 2);
+  $("respHeaders").textContent =
+    "completed = 全部在途写操作拿到明确终态；incomplete = 存在超时/回执不明操作，会话保持禁用。";
   return data;
 }
 
+$("logoutBtn").onclick = () => doLogout("手动退出");
+
+// 演示 1：慢配置期间退出（含重复退出共享等待）
+$("demoSlowBtn").onclick = async () => {
+  const cfg = {
+    profile: "public", failure: "none", latency_ms: 100, max_age: 30,
+    config_delay_ms: 0, delay_ms: 6000, // 单次 6s 延迟，不持久化
+  };
+  $("respMeta").innerHTML = `<span class="spinner"></span>提交 6 秒慢配置…`;
+  const t0 = performance.now();
+  const configPromise = adminFetch("/proxy/upstream/config", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify(cfg),
+  }).then(async r => ({ httpStatus: r.status, body: await r.json() }));
+
+  await new Promise(res => setTimeout(res, 400));
+  // 配置仍在途：立即发起两次退出，验证共享同一等待
+  const logout1 = doLogout("慢配置期间退出 #1");
+  await new Promise(res => setTimeout(res, 150));
+  const logout2 = doLogout("慢配置期间退出 #2（重复退出共享等待）");
+  const safe = (p) => p.catch(e => ({ error: String(e) }));
+  const [cfgResult, l1, l2] = await Promise.all([
+    safe(configPromise), safe(logout1), safe(logout2),
+  ]);
+  const ms = Math.round(performance.now() - t0);
+
+  // 会话已禁用：新管理请求必须 401
+  let probeStatus = 0;
+  try {
+    const pr = await fetch("/proxy/state");
+    probeStatus = pr.status;
+  } catch (_) {}
+
+  $("respBody").textContent = JSON.stringify({
+    total_elapsed_ms: ms,
+    slow_config_response: cfgResult,
+    logout_1: l1,
+    logout_2: l2,
+    post_logout_probe_status: probeStatus, // 期望 401
+    note: "两个退出应同时结束（共享 drain）；公告请求全程不受影响。",
+  }, null, 2);
+};
+
+// 演示 2：上游写超时 -> 回执不明 -> 退出 incomplete，会话保持禁用
+$("demoTimeoutBtn").onclick = async () => {
+  const cfg = {
+    profile: "public", failure: "none", latency_ms: 100, max_age: 30,
+    config_delay_ms: 0, delay_ms: 12000, // 超过管理写超时（默认 8s）
+  };
+  $("respMeta").innerHTML = `<span class="spinner"></span>提交 12 秒配置（管理写超时默认 8s）…`;
+  const t0 = performance.now();
+  let cfgResult;
+  try {
+    const r = await adminFetch("/proxy/upstream/config", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify(cfg),
+    });
+    cfgResult = { httpStatus: r.status, body: await r.json() };
+  } catch (e) {
+    cfgResult = { error: String(e) };
+  }
+  const cfgMs = Math.round(performance.now() - t0);
+  const logout = await doLogout("写超时后退出");
+  $("respBody").textContent = JSON.stringify({
+    config_elapsed_ms: cfgMs,
+    config_response_expect_504_ambiguous: cfgResult,
+    logout_expect_incomplete: logout,
+    hint: "会话保持禁用；约 12 秒后上游实际生效，重新登录后查看上游状态可核对真实结果。",
+  }, null, 2);
+};
+
+// ---------- 公告请求（无需登录） ----------
+
 $("sendBtn").onclick = async () => {
   await doFetch("单次请求");
-  await Promise.all([refreshState(), refreshUpstream()]);
+  if (loggedIn) await Promise.all([refreshState(), refreshUpstream()]);
 };
 
 $("burstBtn").onclick = async () => {
@@ -357,12 +570,12 @@ $("burstBtn").onclick = async () => {
   $("respBody").textContent = JSON.stringify(results, null, 2);
   $("respHeaders").textContent =
     "若上游请求表中只有 1 条对应请求，且仅 1 个 MISS、其余 MISS-WAIT，即合并成功。";
-  await Promise.all([refreshState(), refreshUpstream()]);
+  if (loggedIn) await Promise.all([refreshState(), refreshUpstream()]);
 };
 
 $("purgeBtn").onclick = async () => {
   const id = $("purgeId").value.trim();
-  const r = await fetch(`/proxy/purge/${encodeURIComponent(id)}`, { method: "POST" });
+  const r = await adminFetch(`/proxy/purge/${encodeURIComponent(id)}`, { method: "POST" });
   const data = await r.json();
   $("respMeta").innerHTML = `清除完成 <span class="pill bypass">PURGE</span>`;
   $("respBody").textContent = JSON.stringify(data, null, 2);
@@ -371,8 +584,7 @@ $("purgeBtn").onclick = async () => {
   await Promise.all([refreshState(), refreshUpstream()]);
 };
 
-// 在途清除演示：先把延迟拉高 -> 并发发起 3 个请求 -> 立刻清除 -> 观察：
-// 在途单元 purged=true；其完成后不回填；清除后再请求得到全新上游请求。
+// 在途清除演示
 $("purgeInFlightBtn").onclick = async () => {
   const id = $("purgeId").value.trim() || "1";
   $("noticeId").value = id;
@@ -383,11 +595,12 @@ $("purgeInFlightBtn").onclick = async () => {
   const t0 = performance.now();
   const inflight = Promise.all([mk(), mk(), mk()]);
   await new Promise(r => setTimeout(r, 300));
-  await refreshState(); // 应看到 1 个在途单元
-  const purge = await (await fetch(`/proxy/purge/${encodeURIComponent(id)}`,
-    { method: "POST" })).json();
+  await refreshState();
+  const purgeResp = await adminFetch(`/proxy/purge/${encodeURIComponent(id)}`,
+    { method: "POST" });
+  const purge = await purgeResp.json();
   const beforeDone = await inflight;
-  const after = await mk(); // 清除后的新请求：必须重新打上游
+  const after = await mk();
   const ms = Math.round(performance.now() - t0);
   const before = await Promise.all(beforeDone.map(async r => ({
     status: r.status, xCache: r.headers.get("X-Cache"),
@@ -413,20 +626,21 @@ $("clearCookieBtn").onclick = () => {
 
 $("applyUpstream").onclick = () => applyUpstreamConfig();
 $("resetUpstream").onclick = async () => {
-  await fetch("/proxy/upstream/reset", { method: "POST" });
-  await fetch("/proxy/reset", { method: "POST" });
+  await adminFetch("/proxy/upstream/reset", { method: "POST" });
+  await adminFetch("/proxy/reset", { method: "POST" });
   $("upProfile").value = "public"; $("upFailure").value = "none";
-  $("upLatency").value = 200; $("upMaxAge").value = 30; $("upScopeNotice").value = "";
+  $("upLatency").value = 200; $("upMaxAge").value = 30;
+  $("upScopeNotice").value = ""; $("upConfigDelay").value = 0;
   await Promise.all([refreshUpstream(), refreshState()]);
 };
 $("proxyResetBtn").onclick = async () => {
-  const data = await (await fetch("/proxy/reset", { method: "POST" })).json();
+  const r = await adminFetch("/proxy/reset", { method: "POST" });
+  const data = await r.json();
   $("respMeta").innerHTML = `<span class="pill err">RESET</span> 代理缓存已清空`;
   $("respBody").textContent = JSON.stringify(data, null, 2);
   $("respHeaders").textContent = "代际计数保留；缓存与在途单元全部清空。";
   await refreshState();
 };
-const preset = (p) => $("applyUpstream").onclick;
 $("presetPublic").onclick = () => {
   $("upProfile").value = "public"; $("upFailure").value = "none";
   $("upLatency").value = 200; $("upMaxAge").value = 30;
@@ -448,9 +662,10 @@ $("refreshState").onclick = refreshState;
 $("refreshUpstream").onclick = refreshUpstream;
 
 refreshCookieStatus();
-refreshState();
-refreshUpstream();
-setInterval(() => { refreshState(); refreshUpstream(); }, 4000);
+checkSession().then(on => {
+  if (on) { refreshState(); refreshUpstream(); }
+});
+setInterval(() => { if (loggedIn) { refreshState(); refreshUpstream(); } }, 4000);
 </script>
 </body>
 </html>

@@ -5,10 +5,17 @@ services:
     command: >
       uvicorn proxy.app:app --host 0.0.0.0 --port 8000
     environment:
-      # 上游固定，仅指向本地上游服务
+      # 上游固定，仅指向本 compose 网络内的上游服务
       UPSTREAM_BASE: http://upstream:8001
       UPSTREAM_TIMEOUT_SECONDS: "15"
+      # 管理类上游写操作超时：超出即判定回执不明，退出不能报成功
+      ADMIN_TIMEOUT_SECONDS: "8"
+      # 启动配置的管理口令（演示默认值；生产请通过环境/机密覆盖）
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-admin123}"
+      # 管理 POST 允许的固定 Origin，缺失或不符一律拒绝
+      ADMIN_ALLOWED_ORIGIN: "${ADMIN_ALLOWED_ORIGIN:-http://localhost:8000}"
     ports:
+      # 仅代理发布宿主端口，浏览器入口 http://localhost:8000/
       - "8000:8000"
     depends_on:
       upstream:
@@ -25,8 +32,10 @@ services:
     image: notice-cache-proxy:latest
     command: >
       uvicorn upstream.app:app --host 0.0.0.0 --port 8001
-    ports:
-      - "8001:8001"
+    # 不发布宿主端口：上游只能在 compose 内部网络被代理访问，
+    # 宿主机与外部无法直连，管理/审计操作一律经代理鉴权后转发。
+    expose:
+      - "8001"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=3).status==200 else 1)"]
       interval: 5s

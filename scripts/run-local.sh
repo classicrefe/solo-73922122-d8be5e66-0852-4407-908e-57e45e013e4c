@@ -7,6 +7,11 @@ cd "$(dirname "$0")/.."
 PYTHON="${PYTHON:-python3}"
 UPSTREAM_PORT="${UPSTREAM_PORT:-8001}"
 PROXY_PORT="${PROXY_PORT:-8000}"
+# 管理口令（启动配置）；本地演示默认 admin123，可由环境覆盖
+ADMIN_PASSWORD="${ADMIN_PASSWORD:-admin123}"
+# 管理 POST 允许的固定 Origin（本地 127.0.0.1 入口）
+ADMIN_ALLOWED_ORIGIN="${ADMIN_ALLOWED_ORIGIN:-http://127.0.0.1:${PROXY_PORT}}"
+ADMIN_TIMEOUT_SECONDS="${ADMIN_TIMEOUT_SECONDS:-8}"
 LOG_DIR="$(pwd)/.run"
 mkdir -p "$LOG_DIR"
 
@@ -30,7 +35,11 @@ echo $! > "$LOG_DIR/upstream.pid"
 wait_healthz "$UPSTREAM_PORT"
 
 echo "starting proxy on :${PROXY_PORT} (upstream=http://127.0.0.1:${UPSTREAM_PORT}) ..."
-UPSTREAM_BASE="http://127.0.0.1:${UPSTREAM_PORT}" PYTHONUNBUFFERED=1 \
+UPSTREAM_BASE="http://127.0.0.1:${UPSTREAM_PORT}" \
+ADMIN_PASSWORD="$ADMIN_PASSWORD" \
+ADMIN_ALLOWED_ORIGIN="$ADMIN_ALLOWED_ORIGIN" \
+ADMIN_TIMEOUT_SECONDS="$ADMIN_TIMEOUT_SECONDS" \
+PYTHONUNBUFFERED=1 \
   "$PYTHON" -m uvicorn proxy.app:app \
   --host 127.0.0.1 --port "$PROXY_PORT" \
   >"$LOG_DIR/proxy.log" 2>&1 &
